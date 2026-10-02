@@ -1,0 +1,196 @@
+---
+layout: null
+---
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Video Chunk Packer</title>
+</head>
+<body style="margin:0; padding:20px; background:#0b1120; color:#f8fafc; font-family:-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; display:flex; justify-content:center; align-items:center; min-height:90vh;">
+
+  <div style="background:#1e293b; border:1px solid #334155; border-radius:14px; padding:24px; max-width:440px; width:100%; box-shadow:0 12px 30px rgba(0,0,0,0.5);">
+    <h2 style="margin-top:0; color:#10b981; font-size:1.25rem;">Video Chunk Packer</h2>
+    <p style="color:#94a3b8; font-size:0.85rem; line-height:1.4;">Select any video file. It will be sliced into scrambled 1MB binary parts and packaged into a `.zip` on your device.</p>
+
+    <div style="margin:20px 0; border:2px dashed #475569; border-radius:8px; padding:28px 12px; text-align:center; background:#0f172a; cursor:pointer;" onclick="document.getElementById('fileInput').click()">
+      <span id="label" style="font-size:0.92rem; font-weight:600; color:#38bdf8;">Tap to Select Video File</span>
+      <input type="file" id="fileInput" accept="video/*" style="display:none;" />
+    </div>
+
+    <div id="progWrap" style="display:none; margin-bottom:16px;">
+      <div style="display:flex; justify-content:space-between; font-size:0.8rem; margin-bottom:6px; color:#cbd5e1;">
+        <span id="status">Reading video...</span>
+        <span id="pct">0%</span>
+      </div>
+      <div style="background:#334155; height:7px; border-radius:4px; overflow:hidden;">
+        <div id="bar" style="background:#10b981; height:100%; width:0%; transition:width 0.1s;"></div>
+      </div>
+    </div>
+
+    <button id="dlBtn" style="display:none; width:100%; padding:12px; background:#10b981; color:#022c22; border:none; border-radius:8px; font-weight:bold; font-size:0.95rem; cursor:pointer;">
+      Download Scrambled .ZIP
+    </button>
+  </div>
+
+  <script>
+    const CHUNK_SIZE = 1024 * 1024; // 1MB
+    const XOR_KEY = 0xAA;
+
+    // Fast CRC-32 Table
+    const table = new Uint32Array(256);
+    for (let i = 0; i < 256; i++) {
+      let c = i;
+      for (let k = 0; k < 8; k++) c = ((c & 1) ? (0xEDB88320 ^ (c >>> 1)) : (c >>> 1));
+      table[i] = c;
+    }
+    function calcCrc(bytes) {
+      let crc = 0xFFFFFFFF;
+      for (let i = 0; i < bytes.length; i++) crc = table[(crc ^ bytes[i]) & 0xFF] ^ (crc >>> 8);
+      return (crc ^ 0xFFFFFFFF) >>> 0;
+    }
+
+    const fileInput = document.getElementById('fileInput');
+    const label = document.getElementById('label');
+    const progWrap = document.getElementById('progWrap');
+    const bar = document.getElementById('bar');
+    const status = document.getElementById('status');
+    const pct = document.getElementById('pct');
+    const dlBtn = document.getElementById('dlBtn');
+
+    let resultBlob = null;
+    let fileName = 'video';
+
+    fileInput.addEventListener('change', async (e) => {
+      const file = e.target.files[0];
+      if (!file) return;
+
+      fileName = file.name.replace(/\.[^/.]+$/, "");
+      label.innerText = file.name;
+      progWrap.style.display = 'block';
+      dlBtn.style.display = 'none';
+
+      const totalChunks = Math.ceil(file.size / CHUNK_SIZE);
+      const chunks = [];
+      const parts = [];
+      const cdEntries = [];
+      let offset = 0;
+
+      for (let i = 0; i < totalChunks; i++) {
+        const start = i * CHUNK_SIZE;
+        const end = Math.min(start + CHUNK_SIZE, file.size);
+
+        // Read 1MB chunk into RAM
+        const buffer = await file.slice(start, end).arrayBuffer();
+        const u8 = new Uint8Array(buffer);
+
+        // XOR Scramble
+        for (let b = 0; b < u8.length; b++) u8[b] ^= XOR_KEY;
+
+        const name = `p_${String(i).padStart(6, '0')}.raw`;
+        chunks.push(name);
+
+        const nameBytes = new TextEncoder().encode(name);
+        const crc = calcCrc(u8);
+        const size = u8.length;
+
+        // Local ZIP Header
+        const lh = new Uint8Array(30 + nameBytes.length);
+        const v = new DataView(lh.buffer);
+        v.setUint32(0, 0x04034b50, true);
+        v.setUint16(4, 20, true);
+        v.setUint32(14, crc, true);
+        v.setUint32(18, size, true);
+        v.setUint32(22, size, true);
+        v.setUint16(26, nameBytes.length, true);
+        lh.set(nameBytes, 30);
+
+        parts.push(lh);
+        parts.push(u8);
+
+        cdEntries.push({ nameBytes, crc, size, offset });
+        offset += lh.length + size;
+
+        if (i % 5 === 0 || i === totalChunks - 1) {
+          const p = Math.round(((i + 1) / totalChunks) * 100);
+          bar.style.width = p + '%';
+          pct.innerText = p + '%';
+          status.innerText = `Slicing ${i + 1}/${totalChunks}...`;
+          await new Promise(r => setTimeout(r, 0)); // Prevents browser tab freezing
+        }
+      }
+
+      // Metadata Manifest
+      const manifest = JSON.stringify({
+        name: file.name,
+        mime: file.type || 'video/mp4',
+        size: file.size,
+        chunks: chunks
+      });
+      const mBytes = new TextEncoder().encode(manifest);
+      const mNameBytes = new TextEncoder().encode('manifest.json');
+      const mCrc = calcCrc(mBytes);
+
+      const mlh = new Uint8Array(30 + mNameBytes.length);
+      const mv = new DataView(mlh.buffer);
+      mv.setUint32(0, 0x04034b50, true);
+      mv.setUint16(4, 20, true);
+      mv.setUint32(14, mCrc, true);
+      mv.setUint32(18, mBytes.length, true);
+      mv.setUint32(22, mBytes.length, true);
+      mv.setUint16(26, mNameBytes.length, true);
+      mlh.set(mNameBytes, 30);
+
+      parts.push(mlh);
+      parts.push(mBytes);
+      cdEntries.push({ nameBytes: mNameBytes, crc: mCrc, size: mBytes.length, offset });
+      offset += mlh.length + mBytes.length;
+
+      // Central Directory
+      const cdStart = offset;
+      let cdLen = 0;
+      for (const f of cdEntries) {
+        const cd = new Uint8Array(46 + f.nameBytes.length);
+        const cv = new DataView(cd.buffer);
+        cv.setUint32(0, 0x02014b50, true);
+        cv.setUint16(4, 20, true);
+        cv.setUint16(6, 20, true);
+        cv.setUint32(16, f.crc, true);
+        cv.setUint32(20, f.size, true);
+        cv.setUint32(24, f.size, true);
+        cv.setUint16(28, f.nameBytes.length, true);
+        cv.setUint32(42, f.offset, true);
+        cd.set(f.nameBytes, 46);
+
+        parts.push(cd);
+        cdLen += cd.length;
+      }
+
+      // End of Central Directory Record
+      const eocd = new Uint8Array(22);
+      const ev = new DataView(eocd.buffer);
+      ev.setUint32(0, 0x06054b50, true);
+      ev.setUint16(8, cdEntries.length, true);
+      ev.setUint16(10, cdEntries.length, true);
+      ev.setUint32(12, cdLen, true);
+      ev.setUint32(16, cdStart, true);
+      parts.push(eocd);
+
+      status.innerText = 'Creating ZIP file...';
+      resultBlob = new Blob(parts, { type: 'application/zip' });
+      status.innerText = `Finished (${(resultBlob.size / 1048576).toFixed(1)} MB)`;
+      dlBtn.style.display = 'block';
+    });
+
+    dlBtn.onclick = () => {
+      if (!resultBlob) return;
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(resultBlob);
+      a.download = `${fileName}.zip`;
+      a.click();
+    };
+  </script>
+</body>
+</html>
+  
